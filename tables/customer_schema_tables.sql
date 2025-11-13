@@ -20,4 +20,9 @@ CREATE TABLE customers.raw_customers_shopify (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 
+CREATE TRIGGER trg_set_timestamp
+BEFORE UPDATE ON customers.raw_customers_shopify
+FOR EACH ROW
+EXECUTE PROCEDURE moddatetime(updated_at);
+
 

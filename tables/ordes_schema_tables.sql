@@ -68,6 +68,12 @@ ADD CONSTRAINT fk_customer
 FOREIGN KEY (customer_id)
 REFERENCES customers.raw_customers_shopify(customer_id);
 
+CREATE TRIGGER trg_set_timestamp
+BEFORE UPDATE ON orders.raw_orders_shopify
+FOR EACH ROW
+EXECUTE PROCEDURE moddatetime(updated_at);
+
+
 
 CREATE TABLE orders.raw_parcels_shopify (
     -- ===== ID =====
@@ -100,3 +106,8 @@ CREATE TABLE orders.raw_parcels_shopify (
     -- ===== SHIPPING =====
     shipping_flag BOOLEAN DEFAULT FALSE
 );
+
+CREATE TRIGGER trg_set_timestamp
+BEFORE UPDATE ON orders.raw_parcels_shopify
+FOR EACH ROW
+EXECUTE PROCEDURE moddatetime(updated_at);
