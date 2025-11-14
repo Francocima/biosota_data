@@ -1,25 +1,29 @@
-// Shopify Bulk Operation JSONL Parser
-// Handles the actual Shopify JSONL format with embedded orders
+// Shopify Bulk Operation JSONL Parser (robust + safe DB ingestion)
+// Paste this file over your existing customers_ingestion.js
 
 const fs = require('fs');
-const readline = require('readline');
-const https = require('https');
+const path = require('path');
 
 // ============================================
 // CONFIGURATION
 // ============================================
 
 const CONFIG = {
-  
-  // Local file path (if you've already downloaded it)
-  localJsonlFile: './Downloads/HTTP_Request.json',
+  // Always resolve relative to script so it works regardless of CWD
+  localJsonlFile: path.join(__dirname, 'customers_raw_data.json'),
 
   // Use local file or download from URL?
-  useLocalFile: true, // Set to true since you already have the file
-  
-  // Batch size for database inserts
-  batchSize: 100,
-  
+  useLocalFile: true,
+
+  // Batch size for database inserts (keep small for Supabase free/small tiers)
+  batchSize: 20,
+
+  // Pause (ms) between batches to avoid hitting DB limits
+  batchCooldownMs: 300,
+
+  // Retry attempts per batch
+  batchRetries: 3,
+
   // Database configuration (adjust for your database)
   database: {
     host: 'aws-1-ap-southeast-2.pooler.supabase.com',
@@ -31,98 +35,123 @@ const CONFIG = {
 };
 
 // ============================================
-// DOWNLOAD JSONL FILE
+// Helpers
 // ============================================
 
-async function downloadFile(url, outputPath) {
-  return new Promise((resolve, reject) => {
-    console.log('Downloading JSONL file...');
-    const file = fs.createWriteStream(outputPath);
-    
-    https.get(url, (response) => {
-      const totalSize = parseInt(response.headers['content-length'], 10);
-      let downloaded = 0;
-      
-      response.on('data', (chunk) => {
-        downloaded += chunk.length;
-        const percent = ((downloaded / totalSize) * 100).toFixed(2);
-        process.stdout.write(`\rDownloading: ${percent}%`);
-      });
-      
-      response.pipe(file);
-      
-      file.on('finish', () => {
-        file.close();
-        console.log('\n✓ Download complete!');
-        resolve(outputPath);
-      });
-    }).on('error', (err) => {
-      fs.unlink(outputPath, () => {});
-      reject(err);
-    });
-  });
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function extractShopifyId(gid) {
+  if (!gid) return null;
+  const match = String(gid).match(/\/(\d+)(\?|$)/);
+  return match ? match[1] : null;
 }
 
 // ============================================
-// STREAM PARSE JSONL
+// PARSE SHOPIFY JSONL / N8N-WRAPPED FILE
 // ============================================
 
-async function parseJsonlStream(filePath) {
-  return new Promise((resolve, reject) => {
-    const customers = {};
-    let lineCount = 0;
-    let orderCount = 0;
-    
-    const fileStream = fs.createReadStream(filePath);
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity
-    });
-    
-    console.log('Parsing JSONL file...');
-    
-    rl.on('line', (line) => {
-      if (line.trim() === '') return;
-      
-      lineCount++;
-      if (lineCount % 1000 === 0) {
-        process.stdout.write(`\rProcessed ${lineCount} lines...`);
+async function parseJsonlFile(filePath) {
+  console.log('Reading Shopify JSONL file...');
+  if (!filePath || typeof filePath !== 'string') {
+    throw new Error('Invalid file path provided to parseJsonlFile');
+  }
+
+  const rawContent = fs.readFileSync(filePath, 'utf8');
+  let jsonlString = null;
+  const trimmed = rawContent.trim();
+
+  try {
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      const outer = JSON.parse(rawContent);
+
+      if (Array.isArray(outer)) {
+        const found = outer.find(el => el && el.json && typeof el.json.data === 'string');
+        if (found) jsonlString = found.json.data;
+        else jsonlString = outer.map(o => JSON.stringify(o)).join('\n');
+      } else if (outer && outer.json && typeof outer.json.data === 'string') {
+        jsonlString = outer.json.data;
+      } else {
+        // fallback to stringifying the object as JSONL (rare)
+        jsonlString = JSON.stringify(outer);
       }
-      
+    }
+  } catch (err) {
+    // If we couldn't parse outer JSON, assume rawContent is plain JSONL
+  }
+
+  if (jsonlString === null) jsonlString = rawContent;
+
+  const lines = jsonlString.split('\n').map(l => l.trim()).filter(l => l !== '');
+  console.log(`✓ Found ${lines.length} JSONL lines`);
+
+  const customers = {};     // map gid => customer obj
+  const pendingOrders = {}; // map parentGid => [order, ...]
+  let orderCount = 0;
+  let badLines = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch (err) {
+      // Try unwrapping quoted JSON inside a string (n8n weirdness), otherwise skip
       try {
-        const obj = JSON.parse(line);
-        
-        // Check if this is a Customer object
-        if (obj.id && obj.id.includes('/Customer/')) {
-          // Initialize orders array if not present
-          if (!obj.orders) {
-            obj.orders = [];
-          }
-          customers[obj.id] = obj;
+        if ((line.startsWith('"') && line.endsWith('"')) || (line.startsWith("'") && line.endsWith("'"))) {
+          const unwrapped = line.slice(1, -1).replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\'/g, "'");
+          obj = JSON.parse(unwrapped);
+        } else {
+          throw err;
         }
-        // Check if this is an Order object with a parent reference
-        else if (obj.id && obj.id.includes('/Order/') && obj.__parentId) {
-          orderCount++;
-          // Add this order to its parent customer
-          if (customers[obj.__parentId]) {
-            customers[obj.__parentId].orders.push(obj);
-          }
-        }
-      } catch (err) {
-        console.error(`\nError parsing line ${lineCount}:`, err.message);
-        console.error('Line content:', line.substring(0, 200));
+      } catch (err2) {
+        console.warn(`⚠ Skipping invalid JSON line ${i + 1}:`, line.slice(0, 200));
+        badLines++;
+        continue;
       }
-    });
-    
-    rl.on('close', () => {
-      console.log(`\n✓ Parsed ${lineCount} lines`);
-      console.log(`✓ Found ${Object.keys(customers).length} customers`);
-      console.log(`✓ Found ${orderCount} orders`);
-      resolve(Object.values(customers));
-    });
-    
-    rl.on('error', reject);
-  });
+    }
+
+    const id = obj && obj.id ? obj.id : null;
+    if (!id) continue;
+
+    if (id.includes('/Customer/')) {
+      if (!obj.orders) obj.orders = [];
+      if (pendingOrders[id]) {
+        obj.orders = obj.orders.concat(pendingOrders[id]);
+        delete pendingOrders[id];
+      }
+      customers[id] = obj;
+    } else if (id.includes('/Order/') || id.includes('/DraftOrder/')) {
+      const parentId = obj.__parentId || obj.__parent_id || obj.parentId || obj.parent;
+      if (parentId) {
+        orderCount++;
+        if (customers[parentId]) {
+          customers[parentId].orders = customers[parentId].orders || [];
+          customers[parentId].orders.push(obj);
+        } else {
+          pendingOrders[parentId] = pendingOrders[parentId] || [];
+          pendingOrders[parentId].push(obj);
+        }
+      } else {
+        // order without parent - skip for now
+      }
+    }
+    if ((i + 1) % 1000 === 0) {
+      process.stdout.write(`\rParsed lines: ${i + 1}/${lines.length}...`);
+    }
+  }
+
+  const pendingCount = Object.values(pendingOrders).reduce((acc, arr) => acc + arr.length, 0);
+  if (pendingCount > 0) {
+    console.warn(`⚠ ${pendingCount} orders could not be attached to a customer (customer records missing)`);
+  }
+
+  console.log(`\n✓ Parsed ${Object.keys(customers).length} customers`);
+  console.log(`✓ Parsed ${orderCount} orders`);
+  if (badLines > 0) console.warn(`⚠ Skipped ${badLines} invalid JSON lines`);
+
+  return Object.values(customers);
 }
 
 // ============================================
@@ -130,23 +159,14 @@ async function parseJsonlStream(filePath) {
 // ============================================
 
 function transformCustomer(customer) {
-  // Extract Shopify ID number from GID (last numbers after final /)
-  const extractId = (gid) => {
-    if (!gid) return null;
-    const match = gid.match(/\/(\d+)(\?|$)/);
-    return match ? match[1] : null;
-  };
-  
   return {
-    // Primary fields - matching your exact schema
-    customer_id: extractId(customer.id),
+    customer_id: extractShopifyId(customer.id),
     first_name: customer.firstName,
     last_name: customer.lastName,
     email: customer.email,
     display_name: customer.displayName,
     phone: customer.phone || customer.defaultAddress?.phone,
-    
-    // Default address fields
+
     address_company: customer.defaultAddress?.company,
     address_1: customer.defaultAddress?.address1,
     address_2: customer.defaultAddress?.address2,
@@ -154,23 +174,20 @@ function transformCustomer(customer) {
     state_code: customer.defaultAddress?.provinceCode,
     country_code: customer.defaultAddress?.countryCode,
     zip_code: customer.defaultAddress?.zip,
-    
-    // Additional info
+
     note: customer.note,
     tax_exempt: customer.taxExempt,
     verified_email: customer.verifiedEmail,
     valid_email_address: customer.validEmailAddress,
-    
-    // Dates
+
     created_at: customer.createdAt,
     updated_at: customer.updatedAt,
-    deleted_at: null, // Not provided in bulk operation
-    
-    // Marketing consent
+    deleted_at: null,
+
     email_marketing_state: customer.emailMarketingConsent?.marketingState,
     email_marketing_opt_in_level: customer.emailMarketingConsent?.marketingOptInLevel,
     email_consent_updated_at: customer.emailMarketingConsent?.consentUpdatedAt,
-    
+
     sms_marketing_state: customer.smsMarketingConsent?.marketingState,
     sms_marketing_opt_in_level: customer.smsMarketingConsent?.marketingOptInLevel,
     sms_consent_updated_at: customer.smsMarketingConsent?.consentUpdatedAt
@@ -178,189 +195,160 @@ function transformCustomer(customer) {
 }
 
 // ============================================
-// SAVE AS CSV (Simple Option)
+// SAVE AS CSV / JSON (unchanged)
 // ============================================
 
-async function saveAsCSV(customers, filename = 'customers_export.csv') {
+function saveAsCSV(customers, filename = 'customers_export.csv') {
   const transformed = customers.map(transformCustomer);
-  
   if (transformed.length === 0) {
     console.log('No customers to export');
     return;
   }
-  
-  // Get headers from first customer
   const headers = Object.keys(transformed[0]);
-  
-  // Create CSV content
   let csv = headers.join(',') + '\n';
-  
   transformed.forEach(customer => {
     const row = headers.map(header => {
       let value = customer[header];
-      
-      // Handle null/undefined
-      if (value === null || value === undefined) {
-        return '';
-      }
-      
-      // Convert to string and escape quotes
+      if (value === null || value === undefined) return '';
       value = String(value).replace(/"/g, '""');
-      
-      // Wrap in quotes if contains comma, newline, or quote
-      if (value.includes(',') || value.includes('\n') || value.includes('"')) {
-        value = `"${value}"`;
-      }
-      
+      if (value.includes(',') || value.includes('\n') || value.includes('"')) value = `"${value}"`;
       return value;
     });
-    
     csv += row.join(',') + '\n';
   });
-  
   fs.writeFileSync(filename, csv);
   console.log(`✓ Saved ${transformed.length} customers to ${filename}`);
 }
 
-// ============================================
-// SAVE AS JSON (Simple Option)
-// ============================================
-
-async function saveAsJSON(customers, filename = 'customers_export.json') {
+function saveAsJSON(customers, filename = 'customers_export.json') {
   const transformed = customers.map(transformCustomer);
   fs.writeFileSync(filename, JSON.stringify(transformed, null, 2));
   console.log(`✓ Saved ${transformed.length} customers to ${filename}`);
 }
 
 // ============================================
-// DATABASE INSERT - PostgreSQL
+// DATABASE INSERT - PostgreSQL (batched, safe)
 // ============================================
 
-async function insertToPostgreSQL(customers) {
-  const { Pool } = require('pg');
-  const pool = new Pool(CONFIG.database);
-  
+const { Pool } = require('pg');
+const pool = new Pool({
+  ...CONFIG.database,
+  max: 3,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 5000
+});
+
+/**
+ * Build a multi-row INSERT ... ON CONFLICT SQL for a batch of transformed customers.
+ * Returns { text, values }
+ */
+function buildUpsertQueryBatch(rows) {
+  // Columns we persist (must match transformCustomer keys)
+  const columns = [
+    'customer_id', 'first_name', 'last_name', 'email', 'address_company',
+    'address_1', 'address_2', 'city', 'state_code', 'country_code', 'zip_code',
+    'phone', 'note', 'tax_exempt', 'created_at', 'updated_at', 'deleted_at',
+    'verified_email', 'valid_email_address', 'email_marketing_state',
+    'email_marketing_opt_in_level', 'email_consent_updated_at',
+    'sms_marketing_state', 'sms_marketing_opt_in_level', 'sms_consent_updated_at',
+    'display_name'
+  ];
+
+  const values = [];
+  const valuePlaceholders = rows.map((r, rowIndex) => {
+    const placeholders = columns.map((_, colIndex) => {
+      const placeholderIndex = rowIndex * columns.length + colIndex + 1;
+      return `$${placeholderIndex}`;
+    });
+    // push values in same order as columns
+    values.push(
+      r.customer_id, r.first_name, r.last_name, r.email, r.address_company,
+      r.address_1, r.address_2, r.city, r.state_code, r.country_code, r.zip_code,
+      r.phone, r.note, r.tax_exempt, r.created_at, r.updated_at, r.deleted_at,
+      r.verified_email, r.valid_email_address, r.email_marketing_state,
+      r.email_marketing_opt_in_level, r.email_consent_updated_at,
+      r.sms_marketing_state, r.sms_marketing_opt_in_level, r.sms_consent_updated_at,
+      r.display_name
+    );
+    return `(${placeholders.join(',')})`;
+  });
+
+  const insertSection = `INSERT INTO customers.raw_customers_shopify (${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+
+  // Build ON CONFLICT DO UPDATE - update all fields except customer_id
+  const updateSets = columns
+    .filter(c => c !== 'customer_id')
+    .map(c => `${c} = EXCLUDED.${c}`)
+    .join(', ');
+
+  const text = `${insertSection}
+    ON CONFLICT (customer_id) DO UPDATE SET ${updateSets}`;
+
+  return { text, values };
+}
+
+async function insertBatch(transformedRows) {
+  // If there are no rows, nothing to do
+  if (!transformedRows || transformedRows.length === 0) return { success: 0, failed: 0 };
+
+  const client = await pool.connect();
   try {
-    await pool.query('BEGIN');
-    
-    const insertQuery = `
-      INSERT INTO customers.raw_customers_shopify (
-        customer_id, first_name, last_name, email, address_company,
-        address_1, address_2, city, state_code, country_code, zip_code,
-        phone, note, tax_exempt, created_at, updated_at, deleted_at,
-        verified_email, valid_email_address, email_marketing_state,
-        email_marketing_opt_in_level, email_consent_updated_at,
-        sms_marketing_state, sms_marketing_opt_in_level, sms_consent_updated_at,
-        display_name
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-        $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
-      )
-      ON CONFLICT (customer_id) 
-      DO UPDATE SET
-        first_name = EXCLUDED.first_name,
-        last_name = EXCLUDED.last_name,
-        email = EXCLUDED.email,
-        address_company = EXCLUDED.address_company,
-        address_1 = EXCLUDED.address_1,
-        address_2 = EXCLUDED.address_2,
-        city = EXCLUDED.city,
-        state_code = EXCLUDED.state_code,
-        country_code = EXCLUDED.country_code,
-        zip_code = EXCLUDED.zip_code,
-        phone = EXCLUDED.phone,
-        note = EXCLUDED.note,
-        tax_exempt = EXCLUDED.tax_exempt,
-        updated_at = EXCLUDED.updated_at,
-        verified_email = EXCLUDED.verified_email,
-        valid_email_address = EXCLUDED.valid_email_address,
-        email_marketing_state = EXCLUDED.email_marketing_state,
-        email_marketing_opt_in_level = EXCLUDED.email_marketing_opt_in_level,
-        email_consent_updated_at = EXCLUDED.email_consent_updated_at,
-        sms_marketing_state = EXCLUDED.sms_marketing_state,
-        sms_marketing_opt_in_level = EXCLUDED.sms_marketing_opt_in_level,
-        sms_consent_updated_at = EXCLUDED.sms_consent_updated_at,
-        display_name = EXCLUDED.display_name
-    `;
-    
-    let successCount = 0;
-    let errorCount = 0;
-    
-    for (const customer of customers) {
-      try {
-        const values = [
-          customer.customer_id,
-          customer.first_name,
-          customer.last_name,
-          customer.email,
-          customer.address_company,
-          customer.address_1,
-          customer.address_2,
-          customer.city,
-          customer.state_code,
-          customer.country_code,
-          customer.zip_code,
-          customer.phone,
-          customer.note,
-          customer.tax_exempt,
-          customer.created_at,
-          customer.updated_at,
-          customer.deleted_at,
-          customer.verified_email,
-          customer.valid_email_address,
-          customer.email_marketing_state,
-          customer.email_marketing_opt_in_level,
-          customer.email_consent_updated_at,
-          customer.sms_marketing_state,
-          customer.sms_marketing_opt_in_level,
-          customer.sms_consent_updated_at,
-          customer.display_name
-        ];
-        
-        await pool.query(insertQuery, values);
-        successCount++;
-      } catch (err) {
-        errorCount++;
-        console.error(`\nError inserting customer ${customer.customer_id}:`, err.message);
-      }
-    }
-    
-    await pool.query('COMMIT');
-    console.log(`✓ Successfully inserted/updated ${successCount} customers`);
-    if (errorCount > 0) {
-      console.log(`⚠ Failed to insert ${errorCount} customers`);
-    }
-    
+    await client.query('BEGIN');
+    const { text, values } = buildUpsertQueryBatch(transformedRows);
+    await client.query(text, values);
+    await client.query('COMMIT');
+    return { success: transformedRows.length, failed: 0 };
   } catch (err) {
-    await pool.query('ROLLBACK');
-    console.error('Database transaction error:', err);
+    await client.query('ROLLBACK').catch(() => { /* ignore rollback error */ });
     throw err;
   } finally {
-    await pool.end();
+    client.release();
   }
 }
 
 // ============================================
-// BATCH PROCESSING
+// BATCH PROCESSING (with retries & cooldown)
 // ============================================
 
-async function processBatch(customers, batchNumber, totalBatches, outputFormat = 'csv') {
-  console.log(`\nProcessing batch ${batchNumber}/${totalBatches} (${customers.length} customers)`);
-  
+async function processBatch(customersBatch, batchNumber, totalBatches, outputFormat = 'database') {
+  console.log(`\nProcessing batch ${batchNumber}/${totalBatches} (${customersBatch.length} customers)`);
+
   // Transform data
-  const transformed = customers.map(transformCustomer);
-  
-  // Choose output method
+  const transformed = customersBatch.map(transformCustomer);
+
   if (outputFormat === 'database') {
-    await insertToPostgreSQL(transformed);
+    // Retry logic per batch
+    let attempt = 0;
+    while (attempt < CONFIG.batchRetries) {
+      try {
+        const result = await insertBatch(transformed);
+        console.log(`✓ Batch ${batchNumber}: inserted ${result.success} rows`);
+        break;
+      } catch (err) {
+        attempt++;
+        console.error(`\nError inserting batch ${batchNumber} (attempt ${attempt}):`, err.message || err);
+        if (attempt >= CONFIG.batchRetries) {
+          console.error(`✖ Batch ${batchNumber} failed after ${attempt} attempts`);
+          throw err;
+        } else {
+          const backoff = 250 * attempt;
+          console.log(`→ Retrying batch ${batchNumber} after ${backoff}ms...`);
+          await sleep(backoff);
+        }
+      }
+    }
+
+    // COOL DOWN between batches to ease DB pressure
+    await sleep(CONFIG.batchCooldownMs);
+
   } else if (outputFormat === 'csv') {
     const filename = `customers_batch_${batchNumber}.csv`;
-    await saveAsCSV(customers, filename);
+    saveAsCSV(customersBatch, filename);
   } else if (outputFormat === 'json') {
     const filename = `customers_batch_${batchNumber}.json`;
-    await saveAsJSON(customers, filename);
+    saveAsJSON(customersBatch, filename);
   }
-  
+
   console.log(`✓ Batch ${batchNumber} complete`);
 }
 
@@ -371,63 +359,60 @@ async function processBatch(customers, batchNumber, totalBatches, outputFormat =
 async function main() {
   try {
     console.log('🚀 Starting Shopify Customer Import\n');
-    
-    // Step 1: Get the JSONL file
-    let filePath;
-    if (CONFIG.useLocalFile) {
-      filePath = CONFIG.localJsonlFile;
-      console.log(`Using local file: ${filePath}`);
-    } else {
-      filePath = './downloaded_customers.jsonl';
-      await downloadFile(CONFIG.bulkOperationUrl, filePath);
-    }
-    
-    // Step 2: Parse JSONL
-    const customers = await parseJsonlStream(filePath);
+    console.log('DEBUG path:', CONFIG.localJsonlFile);
+
+    const customers = await parseJsonlFile(CONFIG.localJsonlFile);
     console.log(`\n📊 Total customers to process: ${customers.length}\n`);
-    
-    // Show sample customer
+
+    if (customers.length === 0) {
+      console.log('No customers found — exiting.');
+      return;
+    }
+
+    // Show sample
     if (customers.length > 0) {
       console.log('Sample customer data:');
+      console.log('- ID:', customers[0].id);
       console.log('- Email:', customers[0].email);
       console.log('- Name:', customers[0].displayName);
       console.log('- Orders:', customers[0].orders?.length || 0);
       console.log('- Addresses:', customers[0].addresses?.length || 0);
       console.log();
     }
-    
-    // Step 3: Choose output format
-    // Options: 'database', 'csv', 'json'
-    const OUTPUT_FORMAT = 'database'; // Change this to your preferred format
-    
+
+    // Choose output format: 'database', 'csv', 'json'
+    const OUTPUT_FORMAT = 'database';
+
     if (OUTPUT_FORMAT === 'csv' || OUTPUT_FORMAT === 'json') {
-      // Save all customers to single file
-      if (OUTPUT_FORMAT === 'csv') {
-        await saveAsCSV(customers);
-      } else {
-        await saveAsJSON(customers);
-      }
-    } else {
-      // Process in batches for database
-      const batches = [];
-      for (let i = 0; i < customers.length; i += CONFIG.batchSize) {
-        batches.push(customers.slice(i, i + CONFIG.batchSize));
-      }
-      
-      console.log(`Processing in ${batches.length} batches of ${CONFIG.batchSize}\n`);
-      
-      for (let i = 0; i < batches.length; i++) {
-        await processBatch(batches[i], i + 1, batches.length, OUTPUT_FORMAT);
-      }
+      if (OUTPUT_FORMAT === 'csv') saveAsCSV(customers);
+      else saveAsJSON(customers);
+      return;
     }
-    
+
+    // Process in batches
+    const batches = [];
+    for (let i = 0; i < customers.length; i += CONFIG.batchSize) {
+      batches.push(customers.slice(i, i + CONFIG.batchSize));
+    }
+
+    console.log(`Processing in ${batches.length} batches of ${CONFIG.batchSize}\n`);
+
+    for (let i = 0; i < batches.length; i++) {
+      await processBatch(batches[i], i + 1, batches.length, OUTPUT_FORMAT);
+    }
+
     console.log('\n✅ All customers processed successfully!');
-    
   } catch (err) {
-    console.error('\n❌ Error:', err);
+    console.error('\n❌ Fatal Error:', err);
     process.exit(1);
+  } finally {
+    // graceful pool shutdown
+    try {
+      await pool.end();
+    } catch (e) {
+      // ignore
+    }
   }
 }
 
-// Run the script
 main();

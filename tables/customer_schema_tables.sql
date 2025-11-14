@@ -21,6 +21,8 @@ CREATE TABLE customers.raw_customers_shopify (
 );
 
 ALTER TABLE customers.raw_customers_shopify
+  add column email_marketing_consented_at    TIMESTAMP,
+  add column sms_marketing_consented_at      TIMESTAMP,
   ADD COLUMN verified_email               BOOLEAN,
   ADD COLUMN valid_email_address          BOOLEAN,
   ADD COLUMN email_marketing_state        VARCHAR(50),
