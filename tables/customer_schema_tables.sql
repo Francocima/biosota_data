@@ -20,6 +20,22 @@ CREATE TABLE customers.raw_customers_shopify (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 
+ALTER TABLE customers.raw_customers_shopify
+  ADD COLUMN verified_email               BOOLEAN,
+  ADD COLUMN valid_email_address          BOOLEAN,
+  ADD COLUMN email_marketing_state        VARCHAR(50),
+  ADD COLUMN email_marketing_opt_in_level VARCHAR(50),
+  ADD COLUMN email_consent_updated_at     TIMESTAMP,
+  ADD COLUMN sms_marketing_state          VARCHAR(50),
+  ADD COLUMN sms_marketing_opt_in_level   VARCHAR(50),
+  ADD COLUMN sms_consent_updated_at       TIMESTAMP,
+  ADD COLUMN display_name                 VARCHAR(200);
+
+
+ALTER TABLE customers.raw_customers_shopify
+    drop column accepts_email_marketing,
+    drop column accepts_sms_marketing;
+
 CREATE TRIGGER trg_set_timestamp
 BEFORE UPDATE ON customers.raw_customers_shopify
 FOR EACH ROW
