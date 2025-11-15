@@ -1,119 +1,75 @@
 CREATE SCHEMA orders;
 
 
-DROP CONSTRAINT
-
 CREATE TABLE orders.raw_orders_shopify (
-    -- =========================
-    -- ORDER IDENTIFICATION
-    -- =========================
-    order_id BIGINT PRIMARY KEY,                  -- Shopify numeric ID
-    order_name VARCHAR(100),                      -- e.g. "#1001"
-    order_number INT,                             -- sequential number
-    email VARCHAR(255),
-    phone VARCHAR(50),
-    customer_id BIGINT,                           -- matches Shopify Customer ID
-
-    -- =========================
-    -- AUDIT FIELDS
-    -- =========================
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    -- =========================
-    -- ORDER STATUS
-    -- =========================
-    financial_status VARCHAR(50),                 -- e.g. PAID, PARTIALLY_REFUNDED
-    fulfillment_status VARCHAR(50),               -- e.g. FULFILLED, PARTIAL
-    cancelled_at TIMESTAMPTZ,
-    cancel_reason VARCHAR(100),
-    processed_at TIMESTAMPTZ,
-    closed_at TIMESTAMPTZ,
+    -- Primary Key
+    order_id BIGINT PRIMARY KEY,
+    customer_id BIGINT,
+    -- CORE ORDER FIELDS
+    name VARCHAR(100),                  -- Order number (e.g., #1001)
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    cancelled_at TIMESTAMP,
+    cancel_reason TEXT,
+    processed_at TIMESTAMP,
+    closed_at TIMESTAMP,
     confirmed BOOLEAN,
-    test BOOLEAN,                                 -- Shopify test order flag
-
-    -- =========================
-    -- TAGS, NOTES & ORIGINS
-    -- =========================
-    tags TEXT,
+    test BOOLEAN,
+    tags TEXT,               -- Comma-separated or JSON array
     note TEXT,
-    referring_site TEXT,
-    landing_site TEXT,
-    source_name VARCHAR(100),                     -- web, pos, shopify draft, etc.
-    referring_site_url TEXT,
-
-    -- =========================
-    -- PRICE / MONEY FIELDS
-    -- All from Shopify Order object
-    -- =========================
-    currency VARCHAR(10),
+    source_name VARCHAR(100),
     
-    subtotal_price NUMERIC(12,2),
-    total_tax NUMERIC(12,2),
-    total_tip NUMERIC(12,2),
-    total_discounts NUMERIC(12,2),
-    total_shipping_price NUMERIC(12,2),
-    total_price NUMERIC(12,2),
-
-    refund_amount NUMERIC(12,2),                  -- sum(refunds[].transactions.amount)
-
-    -- =========================
-    -- DISCOUNT + SHIPPING DETAILS
-    -- =========================
-    discount_code VARCHAR(100),
-    discount_code_type VARCHAR(50),
-    discount_code_amount NUMERIC(12,2),
-
-    shipping_method VARCHAR(255),
-    shipping_carrier VARCHAR(255),
-
-    -- =========================
-    -- PAYMENT DETAILS
-    -- =========================
-    payment_gateway VARCHAR(100),                 -- e.g. "shopify_payments"
-    payment_method VARCHAR(100),
-    payment_id VARCHAR(200),                      -- transaction ID
-    risk_level VARCHAR(50),
-    receipt_number VARCHAR(100),
-
-    -- =========================
+    -- FINANCIAL TOTALS (all in shop's base currency)
+    current_subtotal_price DECIMAL(15, 2),
+    current_total_tax DECIMAL(15, 2),
+    current_total_discounts DECIMAL(15, 2),
+    current_total_price DECIMAL(15, 2),
+    total_shipping_price DECIMAL(15, 2),
+    total_refunded DECIMAL(15, 2),
+    currency_code VARCHAR(3),             -- ISO 4217 (e.g., USD, EUR, AUD)
+    
     -- BILLING ADDRESS
-    -- matches Shopify MailingAddress
-    -- =========================
-    billing_first_name VARCHAR(255),
-    billing_last_name VARCHAR(255),
+    billing_first_name VARCHAR(100),
+    billing_last_name VARCHAR(100),
     billing_company VARCHAR(255),
     billing_address1 VARCHAR(255),
     billing_address2 VARCHAR(255),
-    billing_city VARCHAR(255),
-    billing_province VARCHAR(255),
-    billing_province_code VARCHAR(50),
+    billing_city VARCHAR(100),
+    billing_province VARCHAR(100),
+    billing_province_code VARCHAR(10),
     billing_zip VARCHAR(20),
-    billing_country VARCHAR(255),
-    billing_country_code VARCHAR(10),
+    billing_country VARCHAR(100),
+    billing_country_code VARCHAR(2),      -- ISO 3166-1 alpha-2
     billing_phone VARCHAR(50),
-
-    -- =========================
+    
     -- SHIPPING ADDRESS
-    -- matches Shopify MailingAddress
-    -- =========================
-    shipping_first_name VARCHAR(255),
-    shipping_last_name VARCHAR(255),
+    shipping_first_name VARCHAR(100),
+    shipping_last_name VARCHAR(100),
     shipping_company VARCHAR(255),
     shipping_address1 VARCHAR(255),
     shipping_address2 VARCHAR(255),
-    shipping_city VARCHAR(255),
-    shipping_province VARCHAR(255),
-    shipping_province_code VARCHAR(50),
+    shipping_city VARCHAR(100),
+    shipping_province VARCHAR(100),
+    shipping_province_code VARCHAR(10),
     shipping_zip VARCHAR(20),
-    shipping_country VARCHAR(255),
-    shipping_country_code VARCHAR(10),
-    shipping_phone VARCHAR(50)
+    shipping_country VARCHAR(100),
+    shipping_country_code VARCHAR(2),     -- ISO 3166-1 alpha-2
+    shipping_phone VARCHAR(50),
+    
+    -- FULFILLMENT STATUS (aggregated/latest)
+    fulfillment_status VARCHAR(50),       -- Latest fulfillment status
+    fulfillment_display_status VARCHAR(50) -- Human-readable status
 );
 
 ALTER TABLE orders.raw_orders_shopify
 ADD CONSTRAINT fk_customer
-FOREIGN KEY (customer_id)
-REFERENCES customers.raw_customers_shopify(customer_id);
+  FOREIGN KEY (customer_id)
+  REFERENCES customers.raw_customers_shopify(customer_id)
+  ON DELETE SET NULL;
+
+ALTER TABLE orders.raw_orders_shopify
+DROP CONSTRAINT fk_customer;
+
 
 CREATE TRIGGER trg_set_timestamp
 BEFORE UPDATE ON orders.raw_orders_shopify
